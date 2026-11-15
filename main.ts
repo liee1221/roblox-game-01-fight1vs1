@@ -24,6 +24,12 @@ const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 // screenshots subdir, which runs after game.rbxl and PLAY.json are already copied.
 mkdirSync(out, { recursive: true });
 
+// Fail fast with a clear message if a required input is missing, instead of
+// dying mid-copy with a bare ENOENT from copyFileSync.
+for (const f of ['game.rbxl', 'PLAY.json']) {
+  if (!existsSync(join(here, f))) throw new Error(`missing required input: ${f}`);
+}
+
 copyFileSync(join(here, 'game.rbxl'), join(out, 'game.rbxl'));
 copyFileSync(join(here, 'PLAY.json'), join(out, 'PLAY.json'));
 cpSync(join(here, 'src'), join(out, 'src'), { recursive: true });
