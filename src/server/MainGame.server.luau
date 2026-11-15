@@ -1,493 +1,779 @@
---[[
-	MainGame (Server)
-	- Alur level: countdown 3-2-1-FIGHT, menang/kalah, unlock level
-	- Sistem combat: pukul, pukul kuat, tendang, tangkis, counter, ultimate
-	- AI musuh per level
-]]
+-- MainGame (Script, ServerScriptService)
+-- Server side of Fight 1vs1: a 2D side-view arena fighter, player vs AI.
+-- Owns the arena, the AI opponent, combat validation, damage, blocking,
+-- counters, ultimates, win/lose, and level unlocks. The client only sends
+-- intended actions; the server decides what actually lands.
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
-local Config = require(ReplicatedStorage.GameConfig)
-local Remotes = ReplicatedStorage.Remotes
-local StartLevelEvent = Remotes.StartLevel
-local CombatInputEvent = Remotes.CombatInput
-local EquipWeaponEvent = Remotes.EquipWeapon
-local GameEvent = Remotes.GameEvent
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
 
-local PLAYER_START = CFrame.new(-22, 3.2, 0)
-local AI_START = CFrame.new(22, 3.2, 0)
+local ARENA = Config.ARENA
+local WEAPONS = Config.WEAPONS
+local LEVELS = Config.LEVELS
 
-local state = {
-	active = false,
-	fighting = false,
-	player = nil,
-	ai = nil,
-	level = 0,
-}
+--------------------------------------------------------------------------------
+-- RemoteEvents
+--------------------------------------------------------------------------------
 
--- data per petarung
-local fighterData = {}
+local FightAction = Instance.new("RemoteEvent")
+FightAction.Name = "FightAction" -- client -> server: intended actions
+FightAction.Parent = ReplicatedStorage
 
--- ===== Util =====
+local FightUpdate = Instance.new("RemoteEvent")
+FightUpdate.Name = "FightUpdate" -- server -> client: match state
+FightUpdate.Parent = ReplicatedStorage
 
-local function getFighterData(model)
-	if model and not fighterData[model] then
-		fighterData[model] = {
-			cooldowns = {},
-			blocking = false,
-			counterUntil = 0,
-			stunUntil = 0,
-			meter = 0,
-			weapon = "Katana",
-			isAI = false,
-		}
+--------------------------------------------------------------------------------
+-- Arena: built at runtime so the place file stays tiny.
+-- One long stage on X; matches run in parallel lanes along Z.
+--------------------------------------------------------------------------------
+
+local ArenaFolder = Instance.new("Folder")
+ArenaFolder.Name = "FightArena"
+ArenaFolder.Parent = Workspace
+
+local function makePart(name, size, cframe, color, material, anchored)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = color
+	part.Material = material or Enum.Material.SmoothPlastic
+	part.Anchored = anchored ~= false
+	part.CanCollide = true
+	part.Parent = ArenaFolder
+	return part
+end
+
+local function buildArena()
+	-- Main floor: dark stage with a neon center line.
+	makePart("Floor", Vector3.new(ARENA.HalfWidth * 2 + 8, 2, ARENA.LaneCount * ARENA.LaneSpacing + 16),
+		CFrame.new(0, ARENA.FloorY - 1, 0), Color3.fromRGB(24, 28, 52), Enum.Material.Slate)
+	local center = makePart("CenterLine", Vector3.new(ARENA.HalfWidth * 2 + 8, 0.2, 0.6),
+		CFrame.new(0, ARENA.FloorY + 0.1, 0), Color3.fromRGB(255, 220, 60), Enum.Material.Neon)
+	center.CanCollide = false
+
+	-- End walls so fighters cannot walk off the sides.
+	makePart("WallLeft", Vector3.new(2, 24, ARENA.LaneCount * ARENA.LaneSpacing + 16),
+		CFrame.new(-ARENA.HalfWidth - 4, ARENA.FloorY + 12, 0), Color3.fromRGB(30, 34, 64), Enum.Material.Slate)
+	makePart("WallRight", Vector3.new(2, 24, ARENA.LaneCount * ARENA.LaneSpacing + 16),
+		CFrame.new(ARENA.HalfWidth + 4, ARENA.FloorY + 12, 0), Color3.fromRGB(30, 34, 64), Enum.Material.Slate)
+
+	-- Back wall with glowing red strips and pillars, one per lane gap.
+	makePart("BackWall", Vector3.new(ARENA.HalfWidth * 2 + 8, 22, 2),
+		CFrame.new(0, ARENA.FloorY + 11, -(ARENA.LaneCount * ARENA.LaneSpacing + 16) / 2 - 1),
+		Color3.fromRGB(18, 20, 44), Enum.Material.Slate)
+	for x = -ARENA.HalfWidth, ARENA.HalfWidth, 16 do
+		local strip = makePart("NeonStrip", Vector3.new(10, 0.6, 0.4),
+			CFrame.new(x, ARENA.FloorY + 8, -(ARENA.LaneCount * ARENA.LaneSpacing + 16) / 2 + 0.2),
+			Color3.fromRGB(255, 60, 70), Enum.Material.Neon)
+		strip.CanCollide = false
+		local strip2 = makePart("NeonStripLow", Vector3.new(10, 0.6, 0.4),
+			CFrame.new(x, ARENA.FloorY + 3, -(ARENA.LaneCount * ARENA.LaneSpacing + 16) / 2 + 0.2),
+			Color3.fromRGB(255, 60, 70), Enum.Material.Neon)
+		strip2.CanCollide = false
 	end
-	return model and fighterData[model]
-end
-
-local function syncMeter(model)
-	local fd = fighterData[model]
-	if fd and not fd.isAI and state.player and state.player.Character == model then
-		state.player:SetAttribute("UltimateMeter", math.floor(fd.meter))
+	for i = 0, ARENA.LaneCount do
+		local z = -ARENA.LaneCount * ARENA.LaneSpacing / 2 + i * ARENA.LaneSpacing
+		makePart("Pillar", Vector3.new(2, 22, 2),
+			CFrame.new(0, ARENA.FloorY + 11, z - ARENA.LaneSpacing / 2),
+			Color3.fromRGB(30, 34, 64), Enum.Material.Slate)
 	end
 end
 
-local function playAnim(model, animName)
-	if state.player then
-		GameEvent:FireClient(state.player, {type = "Anim", model = model, anim = animName})
-	end
+buildArena()
+
+-- Lane Z positions, one per parallel match.
+local Lanes = {}
+for i = 1, ARENA.LaneCount do
+	Lanes[i] = {
+		z = -ARENA.LaneCount * ARENA.LaneSpacing / 2 + (i - 0.5) * ARENA.LaneSpacing,
+		busy = false,
+	}
 end
 
-local function announce(text)
-	if state.player then
-		GameEvent:FireClient(state.player, {type = "Announce", text = text})
-	end
-end
-
-local function hitEffect(position, color, big)
-	local p = Instance.new("Part")
-	p.Shape = Enum.PartType.Ball
-	p.Material = Enum.Material.Neon
-	p.Color = color
-	p.Size = big and Vector3.new(4, 4, 4) or Vector3.new(1.6, 1.6, 1.6)
-	p.Position = position
-	p.Anchored = true
-	p.CanCollide = false
-	p.Parent = workspace
-	Debris:AddItem(p, 0.18)
-end
-
-local function dealDamage(model, amount)
-	local hum = model and model:FindFirstChildOfClass("Humanoid")
-	if hum and hum.Health > 0 then
-		hum.Health = math.max(0, hum.Health - amount)
-		local fd = fighterData[model]
-		if fd then
-			fd.meter = math.min(Config.MeterMax, fd.meter + Config.MeterPerDamage)
-			syncMeter(model)
+local function takeLane()
+	for i, lane in ipairs(Lanes) do
+		if not lane.busy then
+			lane.busy = true
+			return i, lane.z
 		end
 	end
+	return nil, nil
 end
 
--- ===== Visual senjata =====
-
-local function attachWeaponVisual(character, weaponName)
-	if not character then return end
-	local old = character:FindFirstChild("WeaponVisual")
-	if old then old:Destroy() end
-
-	local handle = character:FindFirstChild("RightHand")
-		or character:FindFirstChild("Right Arm")
-		or character:FindFirstChild("HumanoidRootPart")
-	if not handle then return end
-
-	local folder = Instance.new("Folder")
-	folder.Name = "WeaponVisual"
-	folder.Parent = character
-
-	local function wpart(size, color, material, offset)
-		local p = Instance.new("Part")
-		p.Size = size
-		p.Color = color
-		p.Material = material or Enum.Material.Metal
-		p.Massless = true
-		p.CanCollide = false
-		p.CFrame = handle.CFrame * CFrame.new(offset)
-		p.Parent = folder
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0 = handle
-		weld.Part1 = p
-		weld.Parent = p
-		return p
-	end
-
-	if weaponName == "Katana" then
-		wpart(Vector3.new(0.2, 0.2, 4.5), Color3.fromRGB(180, 220, 255), Enum.Material.Neon, Vector3.new(0, 0, 2.2))
-		wpart(Vector3.new(0.5, 0.5, 0.7), Color3.fromRGB(40, 40, 40), Enum.Material.Metal, Vector3.new(0, 0, 0.1))
-	elseif weaponName == "Hammer" then
-		wpart(Vector3.new(0.4, 0.4, 2.2), Color3.fromRGB(120, 80, 40), Enum.Material.Wood, Vector3.new(0, 0, 1.2))
-		wpart(Vector3.new(1.7, 1.7, 1.7), Color3.fromRGB(130, 130, 140), Enum.Material.Metal, Vector3.new(0, 0, 2.6))
-	elseif weaponName == "Spear" then
-		wpart(Vector3.new(0.2, 0.2, 6.5), Color3.fromRGB(120, 80, 40), Enum.Material.Wood, Vector3.new(0, 0, 3.2))
-		wpart(Vector3.new(0.4, 0.4, 1), Color3.fromRGB(200, 200, 210), Enum.Material.Neon, Vector3.new(0, 0, 6.8))
+local function freeLane(index)
+	if Lanes[index] then
+		Lanes[index].busy = false
 	end
 end
 
--- ===== Serangan =====
+--------------------------------------------------------------------------------
+-- R6 fighter rig for the AI opponent, built from parts.
+-- Uses the standard R6 joint layout so the Humanoid walks and fights.
+--------------------------------------------------------------------------------
 
-local function tryAttack(attacker, defender, attackName)
-	if not state.fighting then return end
-	local fd = getFighterData(attacker)
-	local atk = Config.Attacks[attackName]
-	if not fd or not atk or not defender then return end
-
-	local now = os.clock()
-	if now < fd.stunUntil then return end
-
-	local weapon = Config.Weapons[fd.weapon]
-	local cooldown = atk.Cooldown * weapon.CooldownMul
-	if fd.cooldowns[attackName] and now - fd.cooldowns[attackName] < cooldown then return end
-	fd.cooldowns[attackName] = now
-
-	local hrpA = attacker:FindFirstChild("HumanoidRootPart")
-	local hrpD = defender:FindFirstChild("HumanoidRootPart")
-	if not (hrpA and hrpD) then return end
-
-	-- hadapkan penyerang ke arah lawan
-	hrpA.CFrame = CFrame.lookAt(hrpA.Position, Vector3.new(hrpD.Position.X, hrpA.Position.Y, hrpA.Position.Z))
-
-	-- animasi serangan (tetap dimainkan walau meleset)
-	playAnim(attacker, attackName)
-
-	local dist = (hrpA.Position - hrpD.Position).Magnitude
-	local range = atk.Range * weapon.RangeMul
-	if dist > range then return end -- meleset
-
-	local dfd = getFighterData(defender)
-	local dmg = atk.Damage * weapon.DamageMul
-	if fd.isAI then
-		local lvl = Config.Levels[state.level]
-		if lvl then dmg *= lvl.DamageMul end
-	end
-
-	if now < dfd.counterUntil then
-		-- COUNTER sukses!
-		dfd.counterUntil = 0
-		fd.stunUntil = now + Config.CounterStun
-		dealDamage(attacker, Config.CounterDamage)
-		hitEffect(hrpA.Position, Color3.fromRGB(255, 255, 0), true)
-		announce("COUNTER!")
-	elseif dfd.blocking then
-		dealDamage(defender, dmg * Config.BlockDamageMul)
-		hitEffect(hrpD.Position, Color3.fromRGB(120, 180, 255))
-	else
-		dealDamage(defender, dmg)
-		hitEffect(hrpD.Position, weapon.Color)
-		-- knockback
-		local dir = math.sign(hrpD.Position.X - hrpA.Position.X)
-		if dir ~= 0 then
-			hrpD.AssemblyLinearVelocity = Vector3.new(dir * 10, 5, 0)
-		end
-	end
-
-	fd.meter = math.min(Config.MeterMax, fd.meter + Config.MeterPerHit)
-	syncMeter(attacker)
+local function motor6d(name, part0, part1, c0, c1)
+	local joint = Instance.new("Motor6D")
+	joint.Name = name
+	joint.Part0 = part0
+	joint.Part1 = part1
+	joint.C0 = c0
+	joint.C1 = c1
+	joint.Parent = part0
+	return joint
 end
 
--- ===== Ultimate per senjata =====
-
-local function runUltimate(attacker, defender, weaponName)
-	local fd = getFighterData(attacker)
-	if not fd or fd.meter < Config.MeterMax or not state.fighting or not defender then return end
-	fd.meter = 0
-	syncMeter(attacker)
-	playAnim(attacker, "Ultimate")
-
-	local humD = defender:FindFirstChildOfClass("Humanoid")
-	if not (humD and humD.Health > 0) then return end
-
-	if weaponName == "Katana" then
-		announce("BLADE RUSH!")
-		for i = 1, 5 do
-			if not state.fighting then break end
-			local hrpA = attacker:FindFirstChild("HumanoidRootPart")
-			local hrpD = defender:FindFirstChild("HumanoidRootPart")
-			if not (hrpA and hrpD) then break end
-			hrpA.CFrame = CFrame.lookAt(Vector3.new(hrpD.Position.X - 4, hrpA.Position.Y, 0), hrpD.Position)
-			dealDamage(defender, 12)
-			hitEffect(hrpD.Position, Color3.fromRGB(0, 200, 255), true)
-			task.wait(0.18)
-		end
-	elseif weaponName == "Hammer" then
-		announce("EARTHQUAKE!")
-		local dfd = getFighterData(defender)
-		dfd.stunUntil = os.clock() + 2.5
-		local hrpD = defender:FindFirstChild("HumanoidRootPart")
-		dealDamage(defender, 45)
-		if hrpD then
-			hitEffect(hrpD.Position - Vector3.new(0, 2, 0), Color3.fromRGB(255, 150, 50), true)
-		end
-	elseif weaponName == "Spear" then
-		announce("THOUSAND THRUSTS!")
-		for i = 1, 8 do
-			if not state.fighting then break end
-			local hrpD = defender:FindFirstChild("HumanoidRootPart")
-			dealDamage(defender, 7)
-			if hrpD then hitEffect(hrpD.Position, Color3.fromRGB(120, 255, 120)) end
-			task.wait(0.1)
-		end
-	end
+local function limb(name, size, color)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.Color = color
+	part.Material = Enum.Material.SmoothPlastic
+	part.Anchored = false
+	part.CanCollide = true
+	return part
 end
 
--- ===== Buat petarung AI =====
-
-local function createAIFighter(levelCfg)
+-- Builds a simple R6-style fighter. `origin` is the CFrame of the feet on the
+-- floor; the rig stands 5 studs tall. Returns the Model.
+local function buildFighter(name, bodyColor, headColor)
 	local model = Instance.new("Model")
-	model.Name = "AIFighter"
+	model.Name = name
 
-	local bodyColor = levelCfg.Color
+	local root = limb("HumanoidRootPart", Vector3.new(2, 2, 1), bodyColor)
+	root.CanCollide = false
+	root.Transparency = 1
+	root.CFrame = CFrame.new(0, 3, 0)
+	root.Parent = model
 
-	local function rpart(name, size, cf, color, collide)
-		local p = Instance.new("Part")
-		p.Name = name
-		p.Size = size
-		p.Color = color
-		p.Material = Enum.Material.SmoothPlastic
-		p.Anchored = false
-		p.CanCollide = collide == true
-		p.CFrame = cf
-		p.Parent = model
-		return p
-	end
+	local torso = limb("Torso", Vector3.new(2, 2, 1), bodyColor)
+	torso.CFrame = CFrame.new(0, 3, 0)
+	torso.Parent = model
 
-	local hrp = rpart("HumanoidRootPart", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0), Color3.new(1, 1, 1), true)
-	hrp.Transparency = 1
-	local torso = rpart("Torso", Vector3.new(2, 2, 1), CFrame.new(0, 3, 0), bodyColor)
-	local head = rpart("Head", Vector3.new(1.2, 1.2, 1.2), CFrame.new(0, 4.6, 0), Color3.fromRGB(255, 204, 153))
-	local band = rpart("Bandana", Vector3.new(1.3, 0.35, 1.3), CFrame.new(0, 5.15, 0), Color3.fromRGB(200, 30, 30))
-	local leftArm = rpart("Left Arm", Vector3.new(1, 2, 1), CFrame.new(-1.5, 3, 0), bodyColor)
-	local rightArm = rpart("Right Arm", Vector3.new(1, 2, 1), CFrame.new(1.5, 3, 0), bodyColor)
-	local legColor = Color3.new(bodyColor.R * 0.6, bodyColor.G * 0.6, bodyColor.B * 0.6)
-	local leftLeg = rpart("Left Leg", Vector3.new(1, 2, 1), CFrame.new(-0.5, 1, 0), legColor)
-	local rightLeg = rpart("Right Leg", Vector3.new(1, 2, 1), CFrame.new(0.5, 1, 0), legColor)
+	local head = limb("Head", Vector3.new(2, 1, 2), headColor)
+	head.CFrame = CFrame.new(0, 4.5, 0)
+	head.Parent = model
 
-	-- tubuh & kepala di-weld permanen, anggota gerak pakai Motor6D agar bisa dianimasikan
-	for _, p in {torso, head, band} do
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0 = hrp
-		weld.Part1 = p
-		weld.Parent = hrp
-	end
+	local leftArm = limb("Left Arm", Vector3.new(1, 2, 1), bodyColor)
+	leftArm.CFrame = CFrame.new(-1.5, 3, 0)
+	leftArm.Parent = model
 
-	local function motor(name, part)
-		local m = Instance.new("Motor6D")
-		m.Name = name
-		m.Part0 = hrp
-		m.Part1 = part
-		m.C0 = hrp.CFrame:Inverse() * part.CFrame
-		m.Parent = hrp
-	end
-	motor("RightShoulder", rightArm)
-	motor("LeftShoulder", leftArm)
-	motor("RightHip", rightLeg)
-	motor("LeftHip", leftLeg)
+	local rightArm = limb("Right Arm", Vector3.new(1, 2, 1), bodyColor)
+	rightArm.CFrame = CFrame.new(1.5, 3, 0)
+	rightArm.Parent = model
 
-	local hum = Instance.new("Humanoid")
-	hum.HipHeight = 2
-	hum.MaxHealth = levelCfg.Health
-	hum.Health = levelCfg.Health
-	hum.WalkSpeed = levelCfg.WalkSpeed
-	hum.Parent = model
+	local leftLeg = limb("Left Leg", Vector3.new(1, 2, 1), bodyColor)
+	leftLeg.CFrame = CFrame.new(-0.5, 1, 0)
+	leftLeg.Parent = model
 
-	model.PrimaryPart = hrp
-	model.Parent = workspace
+	local rightLeg = limb("Right Leg", Vector3.new(1, 2, 1), bodyColor)
+	rightLeg.CFrame = CFrame.new(0.5, 1, 0)
+	rightLeg.Parent = model
+
+	local humanoid = Instance.new("Humanoid")
+	humanoid.RigType = Enum.HumanoidRigType.R6
+	humanoid.DisplayName = name
+	humanoid.Parent = model
+
+	-- Standard R6 joints (canonical C0/C1).
+	motor6d("RootJoint", torso, root,
+		CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+		CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0))
+	motor6d("Neck", torso, head,
+		CFrame.new(0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+		CFrame.new(0, -0.5, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0))
+	motor6d("Right Shoulder", torso, rightArm,
+		CFrame.new(1, 0.5, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+		CFrame.new(-0.5, 0.5, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0))
+	motor6d("Left Shoulder", torso, leftArm,
+		CFrame.new(-1, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+		CFrame.new(0.5, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0))
+	motor6d("Right Hip", torso, rightLeg,
+		CFrame.new(1, -1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+		CFrame.new(0.5, 1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0))
+	motor6d("Left Hip", torso, leftLeg,
+		CFrame.new(-1, -1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+		CFrame.new(-0.5, 1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0))
+
+	model.PrimaryPart = root
 	return model
 end
 
--- ===== AI otak =====
+--------------------------------------------------------------------------------
+-- Weapon visuals: a small model welded to the fighter's right hand.
+-- R15 hands are called "RightHand", R6 arms are "Right Arm".
+--------------------------------------------------------------------------------
 
-local function startAI(aiModel, playerChar, levelCfg)
+local function buildWeaponModel(weaponName)
+	local def = WEAPONS[weaponName] or WEAPONS.Katana
+	local model = Instance.new("Model")
+	model.Name = weaponName
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.35, 1.6, 0.35)
+	handle.Color = Color3.fromRGB(60, 45, 30)
+	handle.Material = Enum.Material.Wood
+	handle.Anchored = false
+	handle.CanCollide = false
+	handle.Parent = model
+
+	if weaponName == "Katana" then
+		local blade = Instance.new("Part")
+		blade.Name = "Blade"
+		blade.Size = Vector3.new(0.18, 3.2, 0.7)
+		blade.Color = Color3.fromRGB(220, 235, 255)
+		blade.Material = Enum.Material.Metal
+		blade.Anchored = false
+		blade.CanCollide = false
+		blade.CFrame = handle.CFrame * CFrame.new(0, 2.3, 0)
+		blade.Parent = model
+	elseif weaponName == "Palu" then
+		local headPart = Instance.new("Part")
+		headPart.Name = "Head"
+		headPart.Size = Vector3.new(1.4, 1.1, 1.1)
+		headPart.Color = Color3.fromRGB(140, 140, 150)
+		headPart.Material = Enum.Material.Metal
+		headPart.Anchored = false
+		headPart.CanCollide = false
+		headPart.CFrame = handle.CFrame * CFrame.new(0, 1.1, 0)
+		headPart.Parent = model
+	else -- Tombak
+		local shaft = Instance.new("Part")
+		shaft.Name = "Shaft"
+		shaft.Size = Vector3.new(0.25, 4.5, 0.25)
+		shaft.Color = Color3.fromRGB(90, 70, 45)
+		shaft.Material = Enum.Material.Wood
+		shaft.Anchored = false
+		shaft.CanCollide = false
+		shaft.CFrame = handle.CFrame * CFrame.new(0, 1.5, 0)
+		shaft.Parent = model
+		local tip = Instance.new("Part")
+		tip.Name = "Tip"
+		tip.Size = Vector3.new(0.3, 1.0, 0.3)
+		tip.Color = def.Color
+		tip.Material = Enum.Material.Metal
+		tip.Anchored = false
+		tip.CanCollide = false
+		tip.CFrame = handle.CFrame * CFrame.new(0, 4.1, 0)
+		tip.Parent = model
+	end
+
+	-- Weld every part to the handle so the model moves as one piece.
+	for _, part in ipairs(model:GetChildren()) do
+		if part:IsA("BasePart") and part ~= handle then
+			local weld = Instance.new("Weld")
+			weld.Part0 = handle
+			weld.Part1 = part
+			weld.C0 = handle.CFrame:Inverse() * part.CFrame
+			weld.Parent = handle
+		end
+	end
+	model.PrimaryPart = handle
+	return model
+end
+
+local function attachWeapon(character, weaponName)
+	if not character then
+		return nil
+	end
+	local arm = character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
+	if not arm then
+		return nil
+	end
+	local old = character:FindFirstChild("FightWeapon")
+	if old then
+		old:Destroy()
+	end
+	local weapon = buildWeaponModel(weaponName)
+	weapon.Name = "FightWeapon"
+	weapon.Parent = character
+	local handle = weapon.PrimaryPart
+	local weld = Instance.new("Weld")
+	weld.Name = "WeaponWeld"
+	weld.Part0 = arm
+	weld.Part1 = handle
+	-- Hold the weapon out to the side, blade pointing forward.
+	weld.C0 = CFrame.new(0, -0.9, 0) * CFrame.Angles(0, 0, math.rad(-90))
+	weld.Parent = arm
+	return weapon
+end
+
+local function detachWeapon(character)
+	if not character then
+		return
+	end
+	local old = character:FindFirstChild("FightWeapon")
+	if old then
+		old:Destroy()
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Match state: one match per player, each in its own lane.
+--------------------------------------------------------------------------------
+
+local Matches = {} -- [Player] = match table
+local Unlocked = {} -- [Player] = highest unlocked level index (1..5)
+local Wins = {} -- [Player] = total wins
+
+local function getMatch(player)
+	return Matches[player]
+end
+
+local function laneZFor(match)
+	return Lanes[match.laneIndex].z
+end
+
+-- Brief slash flash at a position so hits read clearly.
+local function slashEffect(position, color)
+	local flash = Instance.new("Part")
+	flash.Name = "SlashFlash"
+	flash.Size = Vector3.new(3, 0.4, 0.4)
+	flash.CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.rad(45))
+	flash.Color = color or Color3.fromRGB(255, 255, 255)
+	flash.Material = Enum.Material.Neon
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.Parent = ArenaFolder
+	task.delay(0.18, function()
+		flash:Destroy()
+	end)
+end
+
+local function applyKnockback(model, directionX, power)
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	local velocity = root.AssemblyLinearVelocity
+	root.AssemblyLinearVelocity = Vector3.new(directionX * power, math.max(velocity.Y, 2), 0)
+end
+
+local function addUltimate(match, amount)
+	match.meter = math.clamp(match.meter + amount, 0, 100)
+	FightUpdate:FireClient(match.player, "Ultimate", { meter = match.meter })
+end
+
+local function sendHealth(match)
+	FightUpdate:FireClient(match.player, "Health", {
+		playerHealth = match.playerHealth,
+		enemyHealth = match.enemyHealth,
+	})
+end
+
+local function hurtAI(match, damage, knockDir, knockPower, isUltimate)
+	if not match.active then
+		return
+	end
+	if match.aiBlocking and math.random() < 0.5 then
+		damage = damage * 0.35 -- the AI blocked part of it
+	end
+	match.enemyHealth = math.max(0, match.enemyHealth - damage)
+	if match.aiModel then
+		applyKnockback(match.aiModel, knockDir, knockPower)
+		local root = match.aiModel:FindFirstChild("HumanoidRootPart")
+		if root then
+			slashEffect(root.Position + Vector3.new(0, 3, 0),
+				(WEAPONS[match.weapon] or WEAPONS.Katana).Color)
+		end
+	end
+	addUltimate(match, Config.PLAYER.UltimateGainOnHit)
+	sendHealth(match)
+	if match.enemyHealth <= 0 then
+		endMatch(match, true, "KO")
+	end
+end
+
+local function hurtPlayer(match, damage, knockDir, knockPower)
+	if not match.active then
+		return
+	end
+	local now = os.clock()
+	if match.blocking then
+		damage = damage * (1 - Config.PLAYER.BlockReduction)
+		-- A blocked hit opens the counter window.
+		match.counterUntil = now + Config.PLAYER.CounterWindow
+		FightUpdate:FireClient(match.player, "CounterReady", {})
+	end
+	match.playerHealth = math.max(0, match.playerHealth - damage)
+	local character = match.player.Character
+	if character then
+		applyKnockback(character, knockDir, knockPower)
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root then
+			slashEffect(root.Position + Vector3.new(0, 3, 0), Color3.fromRGB(255, 60, 60))
+		end
+	end
+	addUltimate(match, Config.PLAYER.UltimateGainOnTake)
+	sendHealth(match)
+	if match.playerHealth <= 0 then
+		endMatch(match, false, "KO")
+	end
+end
+
+local function cleanupMatch(match)
+	if match.aiModel then
+		match.aiModel:Destroy()
+		match.aiModel = nil
+	end
+	if match.aiLoop then
+		match.aiLoop = false
+	end
+	freeLane(match.laneIndex)
+	detachWeapon(match.player.Character)
+	Matches[match.player] = nil
+end
+
+function endMatch(match, won, reason)
+	if not match.active then
+		return
+	end
+	match.active = false
+	local player = match.player
+	local levelIndex = match.levelIndex
+	if won then
+		Wins[player] = (Wins[player] or 0) + 1
+		Unlocked[player] = math.max(Unlocked[player] or 1, math.min(levelIndex + 1, #LEVELS))
+		local leaderstats = player:FindFirstChild("leaderstats")
+		if leaderstats then
+			local winsStat = leaderstats:FindFirstChild("Wins")
+			if winsStat then
+				winsStat.Value = Wins[player]
+			end
+			local levelStat = leaderstats:FindFirstChild("Level")
+			if levelStat then
+				levelStat.Value = Unlocked[player]
+			end
+		end
+	end
+	FightUpdate:FireClient(player, "MatchEnd", {
+		won = won,
+		reason = reason,
+		level = levelIndex,
+		unlocked = Unlocked[player] or 1,
+		wins = Wins[player] or 0,
+	})
+	-- Leave the scene up for a beat so the end screen lands, then clean up.
+	task.delay(1.5, function()
+		cleanupMatch(match)
+	end)
+end
+
+local function startMatch(player, levelIndex, weaponName)
+	if Matches[player] then
+		return -- already in a match
+	end
+	levelIndex = math.clamp(levelIndex or 1, 1, #LEVELS)
+	if levelIndex > (Unlocked[player] or 1) then
+		return -- level still locked
+	end
+	if not WEAPONS[weaponName] then
+		weaponName = "Katana"
+	end
+	local laneIndex, laneZ = takeLane()
+	if not laneIndex then
+		return -- stage full
+	end
+	local level = LEVELS[levelIndex]
+	local character = player.Character
+	if not character then
+		freeLane(laneIndex)
+		return
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		freeLane(laneIndex)
+		return
+	end
+
+	-- Spawn the AI on the opposite side of the lane.
+	local ai = buildFighter("AIFighter", Color3.fromRGB(70, 75, 110), Color3.fromRGB(220, 200, 170))
+	ai.Parent = Workspace
+	local aiHumanoid = ai:FindFirstChildOfClass("Humanoid")
+	aiHumanoid.MaxHealth = level.EnemyHealth
+	aiHumanoid.Health = level.EnemyHealth
+	aiHumanoid.WalkSpeed = level.EnemySpeed
+	ai:PivotTo(CFrame.new(ARENA.SpawnGap / 2, ARENA.FloorY, laneZ))
+	attachWeapon(ai, level.EnemyWeapon)
+
+	-- Place the player on the other side, facing the AI.
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root then
+		root.CFrame = CFrame.new(-ARENA.SpawnGap / 2, ARENA.FloorY + 3, laneZ)
+	end
+	humanoid.Health = Config.PLAYER.Health
+	humanoid.WalkSpeed = Config.PLAYER.WalkSpeed
+	attachWeapon(character, weaponName)
+
+	local match = {
+		player = player,
+		levelIndex = levelIndex,
+		weapon = weaponName,
+		laneIndex = laneIndex,
+		laneZ = laneZ,
+		aiModel = ai,
+		aiHumanoid = aiHumanoid,
+		enemyHealth = level.EnemyHealth,
+		playerHealth = Config.PLAYER.Health,
+		meter = 0,
+		active = true,
+		blocking = false,
+		aiBlocking = false,
+		counterUntil = 0,
+		lastAttack = 0,
+		lastHeavy = 0,
+		lastAIAttack = 0,
+		aiLoop = true,
+		aiRetreatUntil = 0,
+		aiNextThink = 0,
+	}
+	Matches[player] = match
+
+	FightUpdate:FireClient(player, "MatchStart", {
+		level = levelIndex,
+		levelName = level.Name,
+		weapon = weaponName,
+		enemyName = level.Name,
+		enemyHealth = level.EnemyHealth,
+		playerHealth = Config.PLAYER.Health,
+		laneZ = laneZ,
+	})
+
+	-- AI brain: one loop per match, cheap enough at 4 lanes.
 	task.spawn(function()
-		local fd = getFighterData(aiModel)
-		local hum = aiModel:FindFirstChildOfClass("Humanoid")
-		while state.fighting and aiModel.Parent and hum and hum.Health > 0 do
-			local hrpA = aiModel:FindFirstChild("HumanoidRootPart")
-			local hrpD = playerChar and playerChar:FindFirstChild("HumanoidRootPart")
-			if hrpA and hrpD then
-				local dist = (hrpA.Position - hrpD.Position).Magnitude
-			local weapon = Config.Weapons[fd.weapon]
-			local maxRange = 8 * weapon.RangeMul
-			local now = os.clock()
-			if now < fd.stunUntil then
-				-- pusing, nggak ngapa-ngapain
-			elseif dist > maxRange + 2 then
-				hum:MoveTo(Vector3.new(hrpD.Position.X, hrpA.Position.Y, 0))
-			else
-				hum:MoveTo(hrpA.Position)
-				local r = math.random()
-				if fd.meter >= Config.MeterMax then
-				runUltimate(aiModel, playerChar, fd.weapon)
-			elseif r < levelCfg.BlockChance then
-				fd.blocking = true
-				playAnim(aiModel, "BlockOn")
-				task.wait(0.9)
-				fd.blocking = false
-				playAnim(aiModel, "BlockOff")
-			elseif r < levelCfg.BlockChance + levelCfg.CounterChance then
-				fd.counterUntil = os.clock() + Config.CounterWindow
-				playAnim(aiModel, "Counter")
-			else
-				local roll = math.random()
-				local atkName = roll < 0.5 and "Punch" or (roll < 0.8 and "Kick" or "Heavy")
-				tryAttack(aiModel, playerChar, atkName)
-			end
-			end
-			end
-			task.wait(levelCfg.AttackInterval * (0.7 + math.random() * 0.6))
+		while match.aiLoop and match.active do
+			runAIThink(match)
+			task.wait(Config.AI.ThinkInterval)
 		end
 	end)
 end
 
--- ===== Alur level =====
+--------------------------------------------------------------------------------
+-- Player actions (client -> server). The server validates everything:
+-- match active, cooldowns, range, and facing, so a tampered client cannot
+-- deal damage it should not deal.
+--------------------------------------------------------------------------------
 
-local function startLevel(player, level)
-	if state.active then return end
-	local unlocked = player:GetAttribute("UnlockedLevel") or 1
-	if level < 1 or level > #Config.Levels or level > unlocked then return end
-
-	local levelCfg = Config.Levels[level]
-
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if not hum then return end
-
-	state.active = true
-	state.fighting = false
-	state.level = level
-	state.player = player
-
-	-- reset HP & posisi
-	hum.Health = hum.MaxHealth
-	char:PivotTo(PLAYER_START)
-
-	-- buat AI
-	local ai = createAIFighter(levelCfg)
-	ai:PivotTo(AI_START)
-	state.ai = ai
-
-	local pfd = getFighterData(char)
-	pfd.weapon = player:GetAttribute("Weapon") or "Katana"
-	pfd.meter = 0
-	syncMeter(char)
-	local afd = getFighterData(ai)
-	afd.weapon = levelCfg.Weapon
-	afd.isAI = true
-
-	attachWeaponVisual(char, pfd.weapon)
-	attachWeaponVisual(ai, levelCfg.Weapon)
-
-	local ended = false
-	local function endFight(result)
-		if ended then return end
-		ended = true
-		state.fighting = false
-		if result == "Victory" then
-			local newUnlock = math.min(#Config.Levels, level + 1)
-			if (player:GetAttribute("UnlockedLevel") or 1) < newUnlock then
-				player:SetAttribute("UnlockedLevel", newUnlock)
-			end
-		end
-		GameEvent:FireClient(player, {type = "End", result = result, level = level})
-		task.delay(1.5, function()
-			if ai then
-				ai.Parent = nil
-				fighterData[ai] = nil
-			end
-			fighterData[char] = nil
-			state.ai = nil
-			state.active = false
-			if player.Parent then
-				player:LoadCharacter()
-		end
-		end)
+local function facingSign(match)
+	-- The player stands left of the AI; attacks go right (+X). If the player
+	-- somehow ends up on the other side, attacks go left instead.
+	local character = match.player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local aiRoot = match.aiModel and match.aiModel:FindFirstChild("HumanoidRootPart")
+	if not root or not aiRoot then
+		return 1
 	end
-
-	hum.Died:Connect(function() endFight("Defeat") end)
-	ai:FindFirstChildOfClass("Humanoid").Died:Connect(function() endFight("Victory") end)
-
-	-- watchdog: jatuh dari arena = kalah/ menang
-	task.spawn(function()
-		while state.fighting do
-			local hrpA = ai:FindFirstChild("HumanoidRootPart")
-			local hrpP = char:FindFirstChild("HumanoidRootPart")
-			if hrpA and hrpA.Position.Y < -15 then dealDamage(ai, 9999) end
-			if hrpP and hrpP.Position.Y < -15 then dealDamage(char, 9999) end
-			task.wait(0.2)
-		end
-	end)
-
-	-- countdown 3, 2, 1, FIGHT!
-	for i = 3, 1, -1 do
-		GameEvent:FireClient(player, {type = "Countdown", value = i})
-		task.wait(1)
+	if aiRoot.Position.X >= root.Position.X then
+		return 1
+	else
+		return -1
 	end
-	GameEvent:FireClient(player, {type = "Fight"})
-	state.fighting = true
-	startAI(ai, char, levelCfg)
 end
 
--- ===== Event handlers =====
-
-local function initPlayer(player)
-	if player:GetAttribute("UnlockedLevel") == nil then player:SetAttribute("UnlockedLevel", 1) end
-	if player:GetAttribute("Weapon") == nil then player:SetAttribute("Weapon", "Katana") end
-	if player:GetAttribute("UltimateMeter") == nil then player:SetAttribute("UltimateMeter", 0) end
-end
-
-Players.PlayerAdded:Connect(initPlayer)
-for _, p in Players:GetPlayers() do
-	initPlayer(p)
-end
-
-StartLevelEvent.OnServerEvent:Connect(function(player, level)
-	if typeof(level) == "number" then
-		startLevel(player, math.floor(level))
+local function inRange(match, range)
+	local character = match.player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local aiRoot = match.aiModel and match.aiModel:FindFirstChild("HumanoidRootPart")
+	if not root or not aiRoot then
+		return false
 	end
-end)
+	return math.abs(aiRoot.Position.X - root.Position.X) <= range
+end
 
-CombatInputEvent.OnServerEvent:Connect(function(player, action)
-	local char = player.Character
-	local fd = getFighterData(char)
-	local ai = state.ai
-	if not fd or not state.fighting or not ai then return end
+local function onFightAction(player, action, arg1, arg2)
+	if action == "StartMatch" then
+		startMatch(player, arg1, arg2)
+		return
+	end
+	if action == "LeaveMatch" then
+		local match = getMatch(player)
+		if match then
+			match.active = false
+			cleanupMatch(match)
+		end
+		FightUpdate:FireClient(player, "ShowMenu", {})
+		return
+	end
 
-	if action == "BlockOn" then
-		fd.blocking = true
-		playAnim(char, "BlockOn")
-	elseif action == "BlockOff" then
-		fd.blocking = false
-		playAnim(char, "BlockOff")
+	local match = getMatch(player)
+	if not match or not match.active then
+		return
+	end
+	local weapon = WEAPONS[match.weapon] or WEAPONS.Katana
+	local now = os.clock()
+
+	if action == "Light" then
+		if match.blocking then
+			return
+		end
+		if now - match.lastAttack < weapon.Cooldown then
+			return
+		end
+		match.lastAttack = now
+		if inRange(match, weapon.Range) then
+			hurtAI(match, weapon.Damage, facingSign(match), weapon.Knockback, false)
+		end
+	elseif action == "Heavy" then
+		if match.blocking then
+			return
+		end
+		if now - match.lastHeavy < weapon.HeavyCooldown then
+			return
+		end
+		match.lastHeavy = now
+		if inRange(match, weapon.Range + 1) then
+			hurtAI(match, weapon.HeavyDamage, facingSign(match), weapon.Knockback + 3, false)
+		end
+	elseif action == "Block" then
+		match.blocking = arg1 == true
 	elseif action == "Counter" then
-		fd.counterUntil = os.clock() + Config.CounterWindow
-		playAnim(char, "Counter")
+		if now <= match.counterUntil and inRange(match, weapon.Range + 1) then
+			match.counterUntil = 0
+			match.aiStunnedUntil = now + Config.PLAYER.CounterStun
+			hurtAI(match, Config.PLAYER.CounterDamage, facingSign(match), 8, false)
+		end
 	elseif action == "Ultimate" then
-		runUltimate(char, ai, fd.weapon)
-	elseif Config.Attacks[action] then
-		tryAttack(char, ai, action)
+		if match.meter >= 100 and inRange(match, weapon.Range + 3) then
+			match.meter = 0
+			FightUpdate:FireClient(player, "Ultimate", { meter = 0 })
+			hurtAI(match, weapon.UltimateDamage, facingSign(match), 14, true)
+		end
+	end
+end
+
+FightAction.OnServerEvent:Connect(onFightAction)
+
+--------------------------------------------------------------------------------
+-- AI brain: chase, attack, block, retreat. Runs per match on a think timer.
+--------------------------------------------------------------------------------
+
+function runAIThink(match)
+	if not match.active or not match.aiModel then
+		return
+	end
+	local now = os.clock()
+	if match.aiStunnedUntil and now < match.aiStunnedUntil then
+		return -- stunned by a counter
+	end
+	local level = LEVELS[match.levelIndex]
+	local aiRoot = match.aiModel:FindFirstChild("HumanoidRootPart")
+	local character = match.player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not aiRoot or not root then
+		return
+	end
+	local aiHumanoid = match.aiHumanoid
+	if not aiHumanoid or aiHumanoid.Health <= 0 then
+		return
+	end
+
+	local dx = root.Position.X - aiRoot.Position.X
+	local dist = math.abs(dx)
+	local dir = dx >= 0 and 1 or -1
+
+	-- Sometimes the AI raises its guard instead of attacking.
+	match.aiBlocking = math.random() < level.EnemyBlockChance and dist <= Config.AI.AttackRange + 2
+
+	if now < match.aiRetreatUntil then
+		aiHumanoid:Move(Vector3.new(-dir, 0, 0))
+		return
+	end
+	if dist > Config.AI.AttackRange then
+		-- Chase the player along X.
+		aiHumanoid:Move(Vector3.new(dir * Config.AI.ChaseSpeedMultiplier, 0, 0))
+	else
+		aiHumanoid:Move(Vector3.new(0, 0, 0))
+		if now - match.lastAIAttack >= level.EnemyCooldown then
+			match.lastAIAttack = now
+			local heavy = math.random() < Config.AI.HeavyChance
+			local damage = heavy and level.EnemyHeavyDamage or level.EnemyDamage
+			hurtPlayer(match, damage, dir, heavy and 8 or 4)
+			if math.random() < Config.AI.RetreatChance then
+				match.aiRetreatUntil = now + Config.AI.RetreatTime
+			end
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Watchdog: falling out of the arena loses the match; dead AI ends it.
+--------------------------------------------------------------------------------
+
+RunService.Heartbeat:Connect(function()
+	for player, match in pairs(Matches) do
+		if match.active then
+			local character = player.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root and root.Position.Y < ARENA.KillY then
+				endMatch(match, false, "Fell")
+			elseif match.aiHumanoid and match.aiHumanoid.Health <= 0 then
+				endMatch(match, true, "KO")
+			end
+		end
 	end
 end)
 
-EquipWeaponEvent.OnServerEvent:Connect(function(player, weaponName)
-	if not Config.Weapons[weaponName] then return end
-	player:SetAttribute("Weapon", weaponName)
-	local char = player.Character
-	local fd = getFighterData(char)
-	if fd then
-		fd.weapon = weaponName
-		attachWeaponVisual(char, weaponName)
-	end
+--------------------------------------------------------------------------------
+-- Players: leaderstats, spawn, cleanup.
+--------------------------------------------------------------------------------
+
+local function setupPlayer(player)
+	Unlocked[player] = 1
+	Wins[player] = 0
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	local winsStat = Instance.new("IntValue")
+	winsStat.Name = "Wins"
+	winsStat.Value = 0
+	winsStat.Parent = leaderstats
+	local levelStat = Instance.new("IntValue")
+	levelStat.Name = "Level"
+	levelStat.Value = 1
+	levelStat.Parent = leaderstats
+	leaderstats.Parent = player
+	FightUpdate:FireClient(player, "ShowMenu", {})
+end
+
+local function onCharacterAdded(player, character)
+	local humanoid = character:WaitForChild("Humanoid")
+	humanoid.Died:Connect(function()
+		local match = getMatch(player)
+		if match and match.active then
+			endMatch(match, false, "KO")
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	setupPlayer(player)
+	player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
 end)
 
-return "MainGame siap."
+Players.PlayerRemoving:Connect(function(player)
+	local match = getMatch(player)
+	if match then
+		match.active = false
+		cleanupMatch(match)
+	end
+	Unlocked[player] = nil
+	Wins[player] = nil
+end)
+
+-- Players who joined before this script ran.
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayer(player)
+	player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
+	if player.Character then
+		onCharacterAdded(player, player.Character)
+	end
+end

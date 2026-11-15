@@ -1,16 +1,16 @@
-// Fight 1vs1 — a 2D stick-arena fighting game for Roblox, built for make.fun's
-// "Make the best Roblox game" bounty (roblox-game-01). This program (Node 22, standard library
-// only) hands the game in: it copies game.rbxl, PLAY.json, src/ and screenshots/ from beside
-// this file to the output dir, then writes dossier.json — the summary the judge reads — with
-// the vendored make.fun library (./vendor/makefun-roblox.ts).
+// Fight 1vs1 — entrypoint for make.fun's "Make the best Roblox game" bounty.
+// This is a plain Node 22 program (standard library only). It gathers the
+// entry's files — game.rbxl, PLAY.json, src/, screenshots/ — into the output
+// directory, then asks the vendored make.fun library to write dossier.json,
+// the summary the judge reads first.
 //
-// The place is the real published place file (game.rbxl), saved from Roblox Studio; src/
-// holds the place's own scripts, extracted from that file, so every .luau matches a script
-// in game.rbxl byte for byte. PLAY.json holds the published place. The first screenshot by
-// name is the cover, so the FIGHT! gameplay shot goes first.
+// The place (game.rbxl) is built from src/ by Rojo, so every .luau file in
+// src/ is exactly a script inside the place. PLAY.json points at the live
+// published place. Screenshots are ordered by name; the first one is the
+// cover, so the FIGHT! gameplay shot is named 01-cover.jpg.
 //
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// When run outside the grader, MAKEFUN_OUTPUT_DIR replaces /output:
+//   MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { copyFileSync, cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -20,13 +20,15 @@ import { buildDossier } from './vendor/makefun-roblox.ts';
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// Make sure the output dir exists before the first copy: the starter only creates the
-// screenshots subdir, which runs after game.rbxl and PLAY.json are already copied.
+// Create the output directory up front; the starter only creates the
+// screenshots folder, which happens after the first copies.
 mkdirSync(out, { recursive: true });
 
 // Fail fast with a clear message if a required input is missing, instead of
-// dying mid-copy with a bare ENOENT from copyFileSync.
-for (const f of ['game.rbxl', 'PLAY.json']) {
+// dying mid-copy with a bare ENOENT from copyFileSync. src/ is checked too,
+// because a Rojo build that produced no scripts would otherwise ship an
+// empty game.
+for (const f of ['game.rbxl', 'PLAY.json', 'src']) {
   if (!existsSync(join(here, f))) throw new Error(`missing required input: ${f}`);
 }
 
@@ -36,10 +38,11 @@ cpSync(join(here, 'src'), join(out, 'src'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });
 if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others
-// refuse an entry the scorer would refuse — more than 4 screenshots or one over 256 KiB; a place
-// of more than 500000 instances, whose scripts' sources come to over 8 MiB or whose scripts'
-// paths come to over 1048576 characters, in all.
+// Caps from the scorer (reference/gate.json). Only text_max_bytes shapes the
+// dossier bytes; the rest refuse an entry the scorer would refuse anyway:
+// more than 4 screenshots or one over 256 KiB, a place over 500000
+// instances, scripts over 8 MiB of source, or script paths over 1048576
+// characters in total.
 writeFileSync(
   join(out, 'dossier.json'),
   buildDossier(out, { text_max_bytes: 65536, screenshots: { max: 4, max_bytes: 262144 }, max_instances: 500000, scripts_max_source_bytes: 8388608, scripts_max_path_chars: 1048576 }),
