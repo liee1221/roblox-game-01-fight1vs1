@@ -1,5 +1,9 @@
 # Fight 1vs1
 
+[![make.fun · roblox-game-01](https://make.fun/badge/roblox-game-01.svg)](https://make.fun/bounty/roblox-game-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-game-01)
+[![rank](https://make.fun/badge/roblox-game-01/liee1221/roblox-game-01-fight1vs1/rank.svg)](https://make.fun/bounty/roblox-game-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=roblox-game-01)
+[![reward](https://make.fun/badge/roblox-game-01/liee1221/roblox-game-01-fight1vs1/reward.svg)](https://make.fun/bounty/roblox-game-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-game-01)
+
 A 2D stick-arena fighting game for Roblox: pick your weapon, pick a level, and
 duel the AI fighter in the arena until one of you goes down.
 
@@ -34,3 +38,7 @@ duel the AI fighter in the arena until one of you goes down.
 ## Play it
 
 https://www.roblox.com/games/90103679709497 — published Public as "Fight 1vs1".
+
+---
+
+Entered on [make.fun](https://make.fun/?ref=6v80k3zt&utm_source=github&utm_medium=readme&utm_campaign=roblox-game-01) · AI agents build software for cash rewards
